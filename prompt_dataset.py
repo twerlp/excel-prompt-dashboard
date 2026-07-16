@@ -643,12 +643,155 @@ class AnthropicBackend(LlmBackend):
         return message.content[0].text if message.content else ""
 
 
+class DeepseekBackend(LlmBackend):
+    """Backend for Deepseek API (OpenAI-compatible endpoint)."""
+
+    def __init__(self, model: str = "deepseek-chat", api_key: Optional[str] = None,
+                 base_url: str = "https://api.deepseek.com"):
+        self._model = model
+        self._api_key = api_key or os.environ.get("DEEPSEEK_API_KEY", "")
+        self._base_url = base_url
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def provider_name(self) -> str:
+        return "Deepseek"
+
+    def complete(self, system_prompt: str, user_prompt: str,
+                 metadata: Optional[Dict[str, str]] = None) -> str:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise RuntimeError("Install openai: pip install openai")
+
+        if not self._api_key:
+            return "ERROR: DEEPSEEK_API_KEY not set"
+
+        client = OpenAI(api_key=self._api_key, base_url=self._base_url)
+        response = client.chat.completions.create(
+            model=self._model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        return response.choices[0].message.content or ""
+
+
+class HuggingFaceBackend(LlmBackend):
+    """
+    Local LLM backend using HuggingFace transformers pipeline.
+    Suitable as the 'cheap' tier when Ollama is not available.
+    """
+
+    def __init__(self, model: str = "microsoft/Phi-3-mini-4k-instruct",
+                 temperature: float = 0.4, max_new_tokens: int = 2048):
+        self._model = model
+        self._temperature = temperature
+        self._max_new_tokens = max_new_tokens
+        self._pipeline = None
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def provider_name(self) -> str:
+        return "HuggingFace"
+
+    def _load_pipeline(self):
+        if self._pipeline is not None:
+            return
+        from transformers import pipeline, AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self._model, trust_remote_code=True
+        )
+        self._pipeline = pipeline(
+            "text-generation",
+            model=self._model,
+            tokenizer=self._tokenizer,
+            trust_remote_code=True,
+            device_map="auto",
+        )
+
+    def complete(self, system_prompt: str, user_prompt: str,
+                 metadata: Optional[Dict[str, str]] = None) -> str:
+        self._load_pipeline()
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt_text = self._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        result = self._pipeline(
+            prompt_text,
+            max_new_tokens=self._max_new_tokens,
+            temperature=self._temperature,
+            do_sample=self._temperature > 0,
+        )
+        return result[0]["generated_text"][len(prompt_text):].strip()
+
+
+class CascadeBackend(LlmBackend):
+    """
+    Two-tier generation: cheap model first, evaluate, escalate to strong
+    model if quality below threshold.
+    """
+
+    def __init__(self, tier1: LlmBackend, tier2: LlmBackend,
+                 frs_threshold: float = 0.7, tc_threshold: float = 0.65,
+                 always_both: bool = True):
+        self._tier1 = tier1
+        self._tier2 = tier2
+        self._frs_threshold = frs_threshold
+        self._tc_threshold = tc_threshold
+        self._always_both = always_both
+        self._model = f"cascade({tier1.model_name}→{tier2.model_name})"
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    @property
+    def provider_name(self) -> str:
+        return "Cascade"
+
+    def complete(self, system_prompt: str, user_prompt: str,
+                 metadata: Optional[Dict[str, str]] = None) -> str:
+        category = (metadata or {}).get("category", "")
+        threshold = self._frs_threshold if category.startswith("frs") else self._tc_threshold
+
+        t1_output = self._tier1.complete(system_prompt, user_prompt, metadata)
+        if not self._always_both:
+            from eval_metrics import quick_score
+            score = quick_score(t1_output, category)
+            if score >= threshold:
+                return t1_output
+
+        # Pass the tier-1 output as context to tier-2
+        augmented_prompt = (
+            f"{user_prompt}\n\n"
+            f"## Draft (review and improve)\n{t1_output[:2000]}\n\n"
+            f"Refine the above into a complete, polished output. "
+            f"Fix any gaps, improve specificity, and add missing edge cases."
+        )
+        return self._tier2.complete(system_prompt, augmented_prompt, metadata)
+
+
 # Backend registry
 BACKEND_REGISTRY: Dict[str, type] = {
     "pregenerated": PreGeneratedBackend,
     "internal": InternalLlmBackend,
     "openai": OpenAiBackend,
     "anthropic": AnthropicBackend,
+    "deepseek": DeepseekBackend,
+    "huggingface": HuggingFaceBackend,
 }
 
 
@@ -656,15 +799,49 @@ BACKEND_REGISTRY: Dict[str, type] = {
 # 3. User Story Loader
 # ═══════════════════════════════════════════════════════════════════════════
 
-def load_user_stories() -> List[Dict[str, Any]]:
+def load_user_stories(db_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """
-    Load user stories from the bundled dataset in `generate_dataset.py`.
-    In production, this could also read from an external JSON file.
+    Load user stories from the SQLite knowledge base.
+    Falls back to generate_dataset.py if the KB is not available.
     """
-    # Import the stories list from the sibling script
+    if db_path and Path(db_path).exists():
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT story_id, title, domain, priority, story_points, sprint, "
+            "status, dependencies, user_story, acceptance_criteria "
+            "FROM stories ORDER BY story_id"
+        ).fetchall()
+        conn.close()
+        if rows:
+            stories = [dict(r) for r in rows]
+            # Add story_text for embedding compatibility
+            for s in stories:
+                s["story_text"] = (s.get("user_story", "") + "\n" +
+                                   s.get("acceptance_criteria", ""))
+                # Populate frs field from KB for prompt context
+                s["frs"] = _load_frs_for_story(db_path, s["story_id"])
+            return stories
+
+    # Fallback: import from generate_dataset.py
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from generate_dataset import stories  # type: ignore[import-untyped]
     return stories
+
+
+def _load_frs_for_story(db_path: str, story_id: str) -> str:
+    """Load ground truth FRs for a story from SQLite."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT fr_ref, fr_text FROM functional_requirements "
+        "WHERE story_id = ? AND source = 'ground_truth' ORDER BY fr_ref",
+        (story_id,),
+    ).fetchall()
+    conn.close()
+    return "\n".join(f"{r['fr_ref']}: {r['fr_text']}" for r in rows if r["fr_text"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -792,8 +969,108 @@ def generate_for_story(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5. Excel Writer
+# 4b. Knowledge-Base Persistence
 # ═══════════════════════════════════════════════════════════════════════════
+
+def evaluate_and_store_results(
+    results: List[Dict[str, Any]],
+    kb_path: str = "kb.sqlite",
+    qdrant_path: str = "./qdrant_data",
+) -> None:
+    """
+    For each generated result, compute eval metrics against ground truth
+    and persist to both SQLite and Qdrant.
+    """
+    from eval_metrics import evaluate_frs, evaluate_test_cases
+    from evaluation_kb import KnowledgeBase
+    from qdrant_store import QdrantStore
+
+    if not Path(kb_path).exists():
+        print("  KB not found — skipping evaluate-and-store. Run import_dataset.py first.")
+        return
+
+    kb = KnowledgeBase(kb_path)
+    kb.initialize()
+    store = QdrantStore(path=qdrant_path)
+    store.ensure_collections()
+
+    stored_frs = 0
+    stored_tc = 0
+    for rec in results:
+        story_id = rec["story_id"]
+        try:
+            # Get ground truth from KB
+            gt_frs = [r["fr_text"] for r in kb.get_ground_truth_frs(story_id)]
+
+            # Evaluate FRS
+            frs_scores = evaluate_frs(
+                rec["acceptance_criteria"], rec["generated_frs"], gt_frs
+            )
+            # Evaluate TCs
+            tc_scores = evaluate_test_cases(rec["generated_tc_parsed"])
+
+            # Store FRS experiment
+            frs_exp_id = f"{story_id}-frs-{rec['frs_prompt_name']}"
+            kb.insert_experiment({
+                "id": frs_exp_id,
+                "story_id": story_id,
+                "prompt_name": rec["frs_prompt_name"],
+                "category": "frs",
+                "backend": rec["llm_provider"],
+                "model": rec["llm_model"],
+                "tier": 1,
+                "temperature": 0.2,
+                "timestamp": rec["generation_timestamp"],
+                "generated_content": rec["generated_frs"],
+                "generated_content_hash": hashlib.sha256(
+                    rec["generated_frs"].encode()
+                ).hexdigest()[:12],
+                "prompt_hash": rec["frs_prompt_hash"],
+                **{k: v for k, v in frs_scores.items() if k != "semantic_f1"},
+                "semantic_f1": frs_scores.get("semantic_f1", 0),
+            })
+            kb.insert_generated_frs(story_id, frs_exp_id, rec["generated_frs"])
+            store.upsert_frs_output(
+                experiment_id=frs_exp_id, story_id=story_id,
+                prompt_name=rec["frs_prompt_name"],
+                model=rec["llm_model"], tier=1,
+                fr_lines=rec["generated_frs"], scores=frs_scores,
+            )
+            stored_frs += 1
+
+            # Store TC experiment
+            tc_exp_id = f"{story_id}-tc-{rec['tc_prompt_name']}"
+            kb.insert_experiment({
+                "id": tc_exp_id,
+                "story_id": story_id,
+                "prompt_name": rec["tc_prompt_name"],
+                "category": "test_case",
+                "backend": rec["llm_provider"],
+                "model": rec["llm_model"],
+                "tier": 1,
+                "temperature": 0.2,
+                "timestamp": rec["generation_timestamp"],
+                "generated_content": rec["generated_tc_raw"],
+                "generated_content_hash": hashlib.sha256(
+                    rec["generated_tc_raw"].encode()
+                ).hexdigest()[:12],
+                "prompt_hash": rec["tc_prompt_hash"],
+                **tc_scores,
+            })
+            kb.insert_generated_tcs(story_id, tc_exp_id, rec["generated_tc_parsed"])
+            store.upsert_tc_output(
+                experiment_id=tc_exp_id, story_id=story_id,
+                prompt_name=rec["tc_prompt_name"],
+                model=rec["llm_model"], tier=1,
+                tc_text=rec["generated_tc_raw"], scores=tc_scores,
+            )
+            stored_tc += 1
+
+        except Exception as exc:
+            print(f"  KB store failed for {story_id}: {exc}")
+
+    kb.close()
+    print(f"  KB stored: {stored_frs} FRS + {stored_tc} TC experiments")
 
 STYLES = {
     "header_font": Font(name="Calibri", size=11, bold=True, color="FFFFFF"),
@@ -1041,14 +1318,17 @@ def main():
                         help="Optional JSON file with additional user stories")
     parser.add_argument("--limit", type=int, default=5,
                         help="Max number of stories to process (default 5, for demo)")
+    parser.add_argument("--kb", nargs="?", const="kb.sqlite", default=None,
+                        help="Evaluate and store results in the knowledge base "
+                             "(SQLite + Qdrant). Optionally specify KB path.")
     args = parser.parse_args()
 
     # Resolve output path
     base_dir = Path(__file__).resolve().parent
     output_path = str(base_dir / (args.output or "Dataset_UserStories_FRS_TestCases.xlsx"))
 
-    # Load stories
-    stories = load_user_stories()
+    # Load stories (from KB if available, else fallback to generate_dataset.py)
+    stories = load_user_stories(db_path=args.kb)
     if args.stories:
         with open(args.stories) as fh:
             extra = json.load(fh)
@@ -1091,6 +1371,15 @@ def main():
     # Write the Excel
     prompts_used = [args.frs_prompt, args.tc_prompt]
     append_generated_results_to_excel(output_path, results, prompts_used)
+
+    # Evaluate and store in knowledge base
+    if args.kb:
+        print()
+        evaluate_and_store_results(
+            results,
+            kb_path=args.kb,
+            qdrant_path=str(base_dir / "qdrant_data"),
+        )
 
     # Summary
     total_frs = sum(r["generated_frs_line_count"] for r in results)
