@@ -48,5 +48,11 @@ agents:
   rag:
     top_k: 3
     min_similarity: 0.6
-  cascade:
+compliance:
+  max_iterations: 5
+  threshold_gt: 0.95       # when ground truth exists
+  threshold_self: 0.90     # self-evaluation only
+  critique_inject: true    # feed critique back into prompt each round
+
+cascade:
     max_retries: 2

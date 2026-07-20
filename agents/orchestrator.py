@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 from langchain_core.runnables import RunnableLambda
 
 from .state import AgentContext
-from . import rag_agent, prompt_crafter, cascade_generator, qa_agent, storage_agent
+from . import rag_agent, prompt_crafter, compliance_agent, qa_agent, storage_agent
 
 
 def run_pipeline(
@@ -19,11 +19,16 @@ def run_pipeline(
     qdrant_store,
     knowledge_base,
     always_both: bool = True,
-    frs_threshold: float = 0.7,
-    tc_threshold: float = 0.65,
 ) -> AgentContext:
     """
     Execute the full agent pipeline for a single story + category.
+
+    Steps:
+      1. RAG — retrieve similar stories from Qdrant
+      2. Prompt Crafter — select best prompt + inject few-shot examples
+      3. Compliance Agent — iterative generate → evaluate → refine loop
+         until score ≥ threshold or max iterations reached
+      4. Storage — persist to Qdrant + SQLite
 
     Returns the final AgentContext with all outputs and scores.
     """
@@ -34,24 +39,15 @@ def run_pipeline(
     )
 
     try:
-        # Step 1: Retrieve similar stories
         ctx = rag_agent.retrieve(ctx, qdrant_store)
-
-        # Step 2: Select and build prompt
         ctx = prompt_crafter.build(ctx, prompt_templates, knowledge_base)
 
-        # Step 3: Generate with cascade
-        ctx = cascade_generator.generate(
-            ctx, cheap_backend, strong_backend,
+        # Compliance loop replaces old cascade + QA steps
+        ctx = compliance_agent.refine_until_compliant(
+            ctx, cheap_backend, strong_backend, knowledge_base,
             always_both=always_both,
-            frs_threshold=frs_threshold,
-            tc_threshold=tc_threshold,
         )
 
-        # Step 4: Evaluate
-        ctx = qa_agent.evaluate(ctx, knowledge_base)
-
-        # Step 5: Persist
         ctx = storage_agent.persist(ctx, qdrant_store, knowledge_base)
 
     except Exception as exc:

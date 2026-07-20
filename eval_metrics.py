@@ -260,3 +260,41 @@ def evaluate_test_cases(tc_list: List[Dict[str, Any]]) -> Dict[str, float]:
         "tc_expected_measurability": tc_expected_measurability(tc_list),
         "tc_completeness": completeness_tc(tc_list),
     }
+
+
+# ── Self-evaluation (no ground truth required) ──────────────────────────
+
+def compliance_self_frs(acceptance_criteria: str, generated_frs: str) -> Dict[str, float]:
+    """
+    Evaluate FRS quality without ground truth.
+    Uses format compliance, AC semantic coverage, and FR count adequacy.
+    """
+    cov = ac_coverage(acceptance_criteria, generated_frs)
+    fmt = format_compliance_frs(generated_frs)
+    ac_items = _extract_ac_items(acceptance_criteria)
+    fr_lines = [l for l in generated_frs.split("\n") if l.strip().startswith("FR-")]
+    fr_count = len(fr_lines)
+    ac_count = len(ac_items)
+    count_ratio = fr_count / ac_count if ac_count > 0 else 0
+    count_score = max(0.0, min(1.0, 1.0 - abs(count_ratio - 1.0)))
+
+    compliance = 0.35 * cov + 0.35 * fmt + 0.30 * count_score
+    return {
+        "ac_coverage": cov,
+        "format_compliance": fmt,
+        "fr_count_score": count_score,
+        "compliance_self": compliance,
+    }
+
+
+def compliance_self_tc(tc_list: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Evaluate TC quality without ground truth.
+    Uses diversity, specificity, and measurability heuristics.
+    """
+    scores = evaluate_test_cases(tc_list)
+    compliance = scores["tc_completeness"]
+    return {
+        **scores,
+        "compliance_self": compliance,
+    }

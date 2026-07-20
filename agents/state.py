@@ -37,6 +37,13 @@ class AgentContext:
     needs_human_review: bool = False
     human_review_reason: str = ""
 
+    # Compliance loop
+    compliance_metric: str = ""       # "completeness" or "compliance_self"
+    compliance_threshold: float = 0.0
+    compliance_score: float = 0.0
+    iterations_used: int = 0
+    iteration_history: List[Dict[str, Any]] = field(default_factory=list)
+
     # Metadata
     experiment_id: str = ""
     error: Optional[str] = None
